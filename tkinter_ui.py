@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Voice Agent Test Application - Tkinter GUI
-A simple voice agent to test clean tool execution with varying complexity levels.
+Voice Agent Test Application - Enhanced Tkinter GUI
+A voice agent demo with toggleable features for testing clean tool execution.
 """
 
 import asyncio
@@ -10,11 +10,14 @@ import os
 import random
 import threading
 import time
+import wave
+import math
+from collections import deque
 from datetime import datetime
-from tkinter import ttk, filedialog, messagebox
 from typing import Any
 
 import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from dotenv import load_dotenv
 
 from livekit.agents import (
@@ -31,20 +34,193 @@ from livekit.plugins import deepgram, openai, cartesia, silero
 # Load environment variables
 load_dotenv()
 
-# Critical system prompt for silent tool execution
-SILENT_TOOL_INSTRUCTION = """
+# ============================================================================
+# BASE SYSTEM PROMPTS
+# ============================================================================
+
+SILENT_MODE_PROMPT = """
 You are a helpful voice assistant. When using tools, NEVER announce that you're using them.
 
 ❌ WRONG: "Let me check the weather for you..."
 ❌ WRONG: "I'll look that up..."
-❌ WRONG: "Calling the weather function..."
 ✅ CORRECT: [silently execute tool, then respond with result]
 
-After tool execution, respond naturally with the information:
-"It's currently 72°F and sunny in San Francisco."
-
-Never mention that you're calling a function or using a tool. Just execute the tool and give the user the result directly.
+After tool execution, respond naturally with the information.
 """
+
+VERBOSE_MODE_PROMPT = """
+You are a helpful voice assistant. When using tools, ALWAYS announce what you're doing.
+
+✅ CORRECT: "Let me check the weather for you..."
+✅ CORRECT: "I'll look that up..."
+After tool execution, respond naturally with the information.
+
+This is VERBOSE/ANNOUNCEMENT mode for comparison testing.
+"""
+
+AUTO_GREETING_PROMPT = """
+When the session starts, greet the user warmly and ask how you can help them today.
+Keep it brief and friendly.
+"""
+
+
+# ============================================================================
+# GUI STATE (shared with tools)
+# ============================================================================
+
+class DemoFeatures:
+    """Toggleable demo features."""
+    def __init__(self):
+        self.verbose_tool_logging = False
+        self.auto_greeting = False
+        self.simulated_latency = False
+        self.latency_ms = 1000
+        self.sound_effects = False
+        self.tool_timeline = False
+        self.transcript_mode = False
+        self.debug_mode = False
+        self.announcement_mode = False
+        self.conversation_summary = True
+        self.audio_level_meter = True
+        self.mock_mode = False
+
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
+
+    def from_dict(self, data):
+        for k, v in data.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+
+demo_features = DemoFeatures()
+gui_instance = None
+
+
+# ============================================================================
+# AUDIO LEVEL METER
+# ============================================================================
+
+class AudioLevelMeter:
+    """Simulated audio level meter for visual feedback."""
+
+    def __init__(self, canvas, width, height):
+        self.canvas = canvas
+        self.width = width
+        self.height = height
+        self.bars = []
+        self.bar_count = 20
+        self.bar_width = width / self.bar_count - 2
+        self.max_height = height - 10
+
+        # Create bars
+        for i in range(self.bar_count):
+            x = i * (self.bar_width + 2) + 1
+            bar = canvas.create_rectangle(
+                x, height - 5, x + self.bar_width, height,
+                fill="#2a4a6e", outline=""
+            )
+            self.bars.append(bar)
+
+        self.is_running = False
+        self.animation_task = None
+
+    def start(self):
+        self.is_running = True
+        self._animate()
+
+    def stop(self):
+        self.is_running = False
+        # Reset all bars
+        for bar in self.bars:
+            self.canvas.coords(bar, 0, self.height, 0, self.height)
+
+    def _animate(self):
+        if not self.is_running:
+            return
+
+        # Simulate audio level based on current state
+        if gui_instance and gui_instance.current_status == 'speaking':
+            level = random.uniform(0.3, 0.9)
+        elif gui_instance and gui_instance.current_status == 'listening':
+            level = random.uniform(0.0, 0.2)
+        else:
+            level = random.uniform(0.0, 0.05)
+
+        active_bars = int(level * self.bar_count)
+
+        for i, bar in enumerate(self.bars):
+            if i < active_bars:
+                # Color gradient from green to red
+                intensity = i / self.bar_count
+                if intensity < 0.5:
+                    color = f"#{int(0 + intensity*2*100):02x}ff88"
+                else:
+                    color = f"#ff{int(255 - (intensity-0.5)*2*100):02x}88"
+
+                x = i * (self.bar_width + 2) + 1
+                h = int(intensity * self.max_height)
+                self.canvas.coords(bar, x, self.height - h, x + self.bar_width, self.height)
+                self.canvas.itemconfig(bar, fill=color)
+            else:
+                x = i * (self.bar_width + 2) + 1
+                self.canvas.coords(bar, x, self.height - 2, x + self.bar_width, self.height)
+                self.canvas.itemconfig(bar, fill="#2a4a6e")
+
+        self.canvas.after(50, self._animate)
+
+
+# ============================================================================
+# TOOL TIMELINE
+# ============================================================================
+
+class ToolTimeline:
+    """Visual timeline of tool executions."""
+
+    def __init__(self, canvas, width, height):
+        self.canvas = canvas
+        self.width = width
+        self.height = height
+        self.entries = []
+        self.start_time = time.time()
+
+        # Draw background grid
+        for i in range(0, width, 50):
+            canvas.create_line(i, 0, i, height, fill="#1a1a3e", width=1)
+
+    def add_tool_call(self, tool_name, duration_ms):
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+
+        # Scale x position (10 seconds = full width)
+        x = min((elapsed / 10) * self.width, self.width - 60)
+
+        # Color by duration
+        if duration_ms < 500:
+            color = "#00ff88"  # Green - quick
+        elif duration_ms < 2000:
+            color = "#ffd93d"  # Yellow - medium
+        elif duration_ms < 5000:
+            color = "#ffa500"  # Orange - long
+        else:
+            color = "#ff4757"  # Red - very long
+
+        # Draw marker
+        y = 15
+        self.canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill=color, outline="white", width=1)
+
+        # Add tooltip text
+        text = f"{tool_name}: {duration_ms}ms"
+        self.canvas.create_text(x, y + 20, text=text, fill="white", font=("Arial", 8), angle=45)
+
+    def reset(self):
+        self.canvas.delete("all")
+        self.start_time = time.time()
+        self.entries = []
+
+        # Redraw grid
+        for i in range(0, self.width, 50):
+            self.canvas.create_line(i, 0, i, self.height, fill="#1a1a3e", width=1)
 
 
 # ============================================================================
@@ -55,10 +231,19 @@ Never mention that you're calling a function or using a tool. Just execute the t
 async def get_current_time(context: RunContext[AgentSession], timezone: str = "UTC") -> str:
     """Returns the current time in the user's timezone."""
     start_time = time.time()
+
+    # Apply simulated latency if enabled
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     result = datetime.now().astimezone().strftime("%I:%M %p")
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"get_current_time({timezone}) -> {result} ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("get_current_time", timezone, result, elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("get_current_time", elapsed)
+
     return f"The current time is {result}."
 
 
@@ -66,10 +251,18 @@ async def get_current_time(context: RunContext[AgentSession], timezone: str = "U
 async def flip_coin(context: RunContext[AgentSession]) -> str:
     """Flips a coin and returns heads or tails."""
     start_time = time.time()
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     result = random.choice(["heads", "tails"])
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"flip_coin() -> {result} ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("flip_coin", None, result, elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("flip_coin", elapsed)
+
     return f"It's {result}."
 
 
@@ -77,12 +270,20 @@ async def flip_coin(context: RunContext[AgentSession]) -> str:
 async def roll_dice(context: RunContext[AgentSession], sides: int = 6) -> str:
     """Rolls a die with the specified number of sides (default 6)."""
     start_time = time.time()
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     if sides < 2 or sides > 100:
         sides = 6
     result = random.randint(1, sides)
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"roll_dice({sides}) -> {result} ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("roll_dice", f"sides={sides}", result, elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("roll_dice", elapsed)
+
     return f"You rolled a {result}."
 
 
@@ -91,12 +292,20 @@ async def get_weather(context: RunContext[AgentSession], location: str) -> str:
     """Gets the current weather for a location."""
     start_time = time.time()
     await asyncio.sleep(1.5)
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     conditions = ["sunny", "cloudy", "rainy", "partly cloudy", "windy"]
     temp = random.randint(45, 95)
     condition = random.choice(conditions)
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"get_weather('{location}') -> {temp}°F {condition} ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("get_weather", location, f"{temp}°F {condition}", elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("get_weather", elapsed)
+
     return f"It's currently {temp} degrees Fahrenheit and {condition} in {location}."
 
 
@@ -104,17 +313,25 @@ async def get_weather(context: RunContext[AgentSession], location: str) -> str:
 async def calculator(context: RunContext[AgentSession], expression: str) -> str:
     """Evaluates a mathematical expression."""
     start_time = time.time()
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     try:
         allowed_names = {"__builtins__": {}}
         result = eval(expression, allowed_names)
         elapsed = (time.time() - start_time) * 1000
+
         if gui_instance:
-            gui_instance.log_tool(f"calculator('{expression}') -> {result} ({elapsed:.0f}ms)")
+            gui_instance.log_tool_execution("calculator", expression, str(result), elapsed)
+            if demo_features.tool_timeline:
+                gui_instance.timeline.add_tool_call("calculator", elapsed)
+
         return f"The result is {result}."
     except Exception as e:
         elapsed = (time.time() - start_time) * 1000
         if gui_instance:
-            gui_instance.log_tool(f"calculator('{expression}') -> ERROR: {e} ({elapsed:.0f}ms)")
+            gui_instance.log_tool_execution("calculator", expression, f"ERROR: {e}", elapsed, is_error=True)
         return f"Sorry, I couldn't calculate that. The error was: {str(e)}"
 
 
@@ -123,14 +340,22 @@ async def web_search(context: RunContext[AgentSession], query: str) -> str:
     """Searches the web for information."""
     start_time = time.time()
     await asyncio.sleep(2.0)
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     results = [
         f"Here's what I found about '{query}':",
         f"1. Wikipedia: {query} is a topic of interest with many applications.",
         f"2. News: Recent updates about {query} have been trending.",
     ]
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"web_search('{query}') -> {len(results)} results ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("web_search", query, f"{len(results)} results", elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("web_search", elapsed)
+
     return "\n".join(results)
 
 
@@ -139,6 +364,10 @@ async def analyze_text(context: RunContext[AgentSession], text: str, analysis_ty
     """Analyzes text using AI. Types: sentiment, summary, keywords, translation."""
     start_time = time.time()
     await asyncio.sleep(4.0)
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     text_preview = text[:50] + "..." if len(text) > 50 else text
 
     if analysis_type == "sentiment":
@@ -153,8 +382,12 @@ async def analyze_text(context: RunContext[AgentSession], text: str, analysis_ty
         result = f"Analysis complete for '{text_preview}' with type: {analysis_type}"
 
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"analyze_text('{text_preview}', '{analysis_type}') ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("analyze_text", f"{text_preview} ({analysis_type})", result.split(':')[1] if ':' in result else result, elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("analyze_text", elapsed)
+
     return result
 
 
@@ -163,6 +396,10 @@ async def generate_report(context: RunContext[AgentSession], topic: str, section
     """Generates a detailed report on a topic."""
     start_time = time.time()
     await asyncio.sleep(6.0)
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     section_names = ", ".join(sections)
     result = f"""Report on {topic}:
 Sections: {section_names}
@@ -173,8 +410,12 @@ Detail Level: {detail_level}
 Overall conclusion: The report highlights important aspects of {topic}."""
 
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"generate_report('{topic}', {sections}, '{detail_level}') ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("generate_report", f"{topic} ({len(sections)} sections)", "Complete", elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("generate_report", elapsed)
+
     return result
 
 
@@ -183,13 +424,21 @@ async def database_query(context: RunContext[AgentSession], sql: str, filters: d
     """Executes a database query with optional filters."""
     start_time = time.time()
     await asyncio.sleep(5.0)
+
+    if demo_features.simulated_latency:
+        await asyncio.sleep(demo_features.latency_ms / 1000)
+
     filters_str = json.dumps(filters) if filters else "none"
     result_count = random.randint(5, 50)
     result = f"Query executed: {sql}\nFilters: {filters_str}\nResults: {result_count} records found."
 
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"database_query('{sql}', {filters_str}) -> {result_count} records ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("database_query", sql, f"{result_count} records", elapsed)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("database_query", elapsed)
+
     return result
 
 
@@ -197,6 +446,7 @@ async def database_query(context: RunContext[AgentSession], sql: str, filters: d
 async def trigger_error(context: RunContext[AgentSession], error_type: str = "api_error") -> str:
     """Triggers different types of errors for testing error handling."""
     start_time = time.time()
+
     error_messages = {
         "timeout": "Request timed out. The service took too long to respond.",
         "api_error": "API error: Invalid credentials or rate limit exceeded.",
@@ -204,9 +454,53 @@ async def trigger_error(context: RunContext[AgentSession], error_type: str = "ap
         "network_error": "Network error: Unable to reach the server.",
     }
     elapsed = (time.time() - start_time) * 1000
+
     if gui_instance:
-        gui_instance.log_tool(f"trigger_error('{error_type}') -> simulating error ({elapsed:.0f}ms)")
+        gui_instance.log_tool_execution("trigger_error", error_type, f"Simulated: {error_type}", elapsed, is_error=True)
+        if demo_features.tool_timeline:
+            gui_instance.timeline.add_tool_call("trigger_error", elapsed)
+
     return f"I encountered an issue: {error_messages.get(error_type, 'Unknown error occurred')}. Please try again."
+
+
+# ============================================================================
+# ADDITIONAL DEMO TOOLS
+# ============================================================================
+
+@function_tool
+async def get_system_info(context: RunContext[AgentSession]) -> str:
+    """Returns system information for debugging."""
+    import platform
+    info = {
+        "platform": platform.system(),
+        "python_version": platform.python_version(),
+        "machine": platform.machine(),
+        "session_active": gui_instance.is_running if gui_instance else False,
+    }
+    return f"System info: {json.dumps(info, indent=2)}"
+
+
+@function_tool
+async def set_agent_mood(context: RunContext[AgentSession], mood: str) -> str:
+    """Sets the agent's mood for the conversation. Moods: friendly, professional, playful, terse."""
+    valid_moods = ["friendly", "professional", "playful", "terse"]
+    if mood.lower() not in valid_moods:
+        return f"Please choose a valid mood: {', '.join(valid_moods)}"
+
+    if gui_instance:
+        gui_instance.agent_mood = mood.lower()
+        gui_instance.log("System", f"Agent mood set to: {mood}", "system")
+
+    return f"I'll now respond in a more {mood} manner."
+
+
+@function_tool
+async def get_session_stats(context: RunContext[AgentSession]) -> str:
+    """Returns statistics about the current session."""
+    if gui_instance:
+        stats = gui_instance.get_session_stats()
+        return f"Session stats: {json.dumps(stats, indent=2)}"
+    return "No session statistics available."
 
 
 # ============================================================================
@@ -217,9 +511,17 @@ class VoiceAgentTest(Agent):
     """A voice agent for testing clean tool execution."""
 
     def __init__(self, llm_provider: str = "openai/gpt-4o-mini"):
-        instructions = SILENT_TOOL_INSTRUCTION + """
+        # Build instructions based on demo features
+        instructions = ""
 
-You have access to various tools for different purposes. Use them appropriately:
+        if demo_features.announcement_mode:
+            instructions += VERBOSE_MODE_PROMPT
+        else:
+            instructions += SILENT_MODE_PROMPT
+
+        instructions += f"""
+
+You have access to various tools for different purposes:
 - get_current_time: When user asks what time it is
 - flip_coin: When user wants to flip a coin
 - roll_dice: When user wants to roll dice
@@ -230,17 +532,22 @@ You have access to various tools for different purposes. Use them appropriately:
 - generate_report: For creating structured reports
 - database_query: For database queries
 - trigger_error: For testing error handling
+- set_agent_mood: Change your speaking style (friendly, professional, playful, terse)
+- get_session_stats: Get conversation statistics
+- get_system_info: Get system information
 
-Be friendly, concise, and natural in your responses. Remember: NEVER announce you're using a tool!"""
+Current mood: {getattr(self, 'mood', 'friendly')}
+"""
+
+        if demo_features.debug_mode:
+            instructions += "\n\nDEBUG MODE: You can share internal reasoning when asked."
+
         super().__init__(instructions=instructions)
-
-
-# Global GUI instance for tool logging
-gui_instance = None
+        self.mood = "friendly"
 
 
 # ============================================================================
-# ASYNCIO RUNNER FOR TKINTER
+# ASYNCIO RUNNER
 # ============================================================================
 
 class AsyncioRunner:
@@ -252,19 +559,16 @@ class AsyncioRunner:
         self.running = False
 
     def start(self):
-        """Start the asyncio event loop in a background thread."""
         self.loop = asyncio.new_event_loop()
         self.running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
     def _run_loop(self):
-        """Run the event loop."""
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def stop(self):
-        """Stop the event loop."""
         self.running = False
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
@@ -272,59 +576,80 @@ class AsyncioRunner:
             self.thread.join(timeout=2)
 
     def run_coroutine(self, coro):
-        """Run a coroutine from the main thread."""
         if self.loop:
-            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            return future
+            return asyncio.run_coroutine_threadsafe(coro, self.loop)
         return None
 
 
-# Global asyncio runner
 async_runner = AsyncioRunner()
 
 
 # ============================================================================
-# TKINTER GUI
+# ENHANCED TKINTER GUI
 # ============================================================================
 
 class VoiceAgentGUI:
-    """Main GUI application for Voice Agent Test."""
+    """Enhanced GUI application for Voice Agent Test."""
+
+    # Checkboxes configuration
+    CHECKBOXES = [
+        ("verbose_tool_logging", "Verbose Tool Logging", "Show detailed tool execution info"),
+        ("auto_greeting", "Auto Greeting", "Agent greets on session start"),
+        ("simulated_latency", "Simulated Latency", "Add artificial delay to responses"),
+        ("sound_effects", "Sound Effects", "Play sounds on tool execution"),
+        ("tool_timeline", "Tool Timeline", "Visual timeline of tool calls"),
+        ("transcript_mode", "Transcript Mode", "Show real-time transcription"),
+        ("debug_mode", "Debug Mode", "Show internal agent state"),
+        ("announcement_mode", "Announcement Mode", "Agent announces tools (for comparison)"),
+        ("conversation_summary", "Conversation Summary", "Show stats at session end"),
+        ("audio_level_meter", "Audio Level Meter", "Visual audio input indicator"),
+        ("mock_mode", "Mock Mode", "Use fake responses (faster testing)"),
+    ]
 
     def __init__(self, root):
         global gui_instance
         gui_instance = self
 
         self.root = root
-        self.root.title("Voice Agent Test - Clean Tool Execution")
-        self.root.geometry("900x700")
-        self.root.configure(bg="#1a1a2e")
+        self.root.title("Voice Agent Test - Enhanced Demo")
+        self.root.geometry("1100x850")
+        self.root.configure(bg="#0d0d1a")
 
         # State
         self.is_running = False
         self.session = None
+        self.current_status = "disconnected"  # disconnected, connecting, listening, processing, speaking
+        self.agent_mood = "friendly"
+        self.session_start_time = None
+        self.tool_calls = []
+        self.user_messages = []
+        self.agent_responses = []
 
         # Style
         self.style = ttk.Style()
         self.style.theme_use('clam')
 
-        # Configure colors
+        # Colors
         self.colors = {
-            'bg': '#1a1a2e',
-            'card_bg': '#2a2a4e',
+            'bg': '#0d0d1a',
+            'card_bg': '#1a1a2e',
+            'card_bg_alt': '#252547',
             'text': '#ffffff',
             'accent': '#4a9eff',
+            'accent2': '#7c4dff',
             'success': '#00ff88',
             'warning': '#ffa500',
             'danger': '#ff4757',
-            'muted': '#888888',
+            'muted': '#666688',
         }
 
         # Build UI
         self._build_header()
-        self._build_config_panel()
-        self._build_status_panel()
-        self._build_log_panel()
-        self._build_quick_actions()
+        self._build_main_content()
+
+        # Create components
+        self.timeline = ToolTimeline(self.timeline_canvas, 500, 60)
+        self.audio_meter = AudioLevelMeter(self.audio_canvas, 200, 40)
 
         # Load saved config
         self._load_config()
@@ -332,274 +657,695 @@ class VoiceAgentGUI:
         # Start asyncio runner
         async_runner.start()
 
+        # Start UI update loop
+        self._update_ui()
+
     def _build_header(self):
         """Build the header section."""
-        header = tk.Frame(self.root, bg="#1a1a2e", pady=10)
+        header = tk.Frame(self.root, bg="#0d0d1a", pady=8)
         header.pack(fill='x')
 
-        title = tk.Label(
-            header,
-            text="🎙️ Voice Agent Test",
-            font=("Arial", 24, "bold"),
-            bg="#1a1a2e",
-            fg="#ffffff"
-        )
-        title.pack()
+        title_row = tk.Frame(header, bg="#0d0d1a")
+        title_row.pack()
 
-        subtitle = tk.Label(
-            header,
-            text="Clean Tool Execution Demonstration",
-            font=("Arial", 12),
-            bg="#1a1a2e",
-            fg="#888888"
-        )
-        subtitle.pack()
-
-    def _build_config_panel(self):
-        """Build the configuration panel."""
-        config_frame = tk.Frame(self.root, bg=self.colors['card_bg'], padx=20, pady=15)
-        config_frame.pack(fill='x', padx=10, pady=10)
-
-        # Title
         tk.Label(
-            config_frame,
+            title_row,
+            text="🎙️",
+            font=("Arial", 28),
+            bg="#0d0d1a",
+            fg="#4a9eff"
+        ).pack(side='left', padx=5)
+
+        tk.Label(
+            title_row,
+            text="Voice Agent Test",
+            font=("Arial", 22, "bold"),
+            bg="#0d0d1a",
+            fg="#ffffff"
+        ).pack(side='left')
+
+        tk.Label(
+            title_row,
+            text="Enhanced Demo",
+            font=("Arial", 12),
+            bg="#0d0d1a",
+            fg=self.colors['accent2']
+        ).pack(side='left', padx=10)
+
+        tk.Label(
+            header,
+            text="Clean Tool Execution Demonstration with Toggleable Features",
+            font=("Arial", 10),
+            bg="#0d0d1a",
+            fg="#666688"
+        ).pack()
+
+    def _build_main_content(self):
+        """Build the main content area."""
+        main = tk.Frame(self.root, bg="#0d0d1a")
+        main.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # Left panel - Configuration and Features
+        left_panel = tk.Frame(main, bg="#0d0d1a")
+        left_panel.pack(side='left', fill='both', expand=True)
+
+        self._build_config_panel(left_panel)
+        self._build_features_panel(left_panel)
+        self._build_status_panel(left_panel)
+        self._build_visualization_panel(left_panel)
+
+        # Right panel - Log and Stats
+        right_panel = tk.Frame(main, bg="#0d0d1a", width=400)
+        right_panel.pack(side='right', fill='both', expand=True)
+        right_panel.pack_propagate(False)
+
+        self._build_stats_panel(right_panel)
+        self._build_log_panel(right_panel)
+        self._build_quick_actions(right_panel)
+
+    def _build_config_panel(self, parent):
+        """Build the configuration panel."""
+        config_frame = tk.Frame(parent, bg=self.colors['card_bg'], padx=15, pady=12)
+        config_frame.pack(fill='x', padx=(0, 5), pady=5)
+
+        # Collapsible header
+        header = tk.Frame(config_frame, bg=self.colors['card_bg'])
+        header.pack(fill='x')
+
+        tk.Label(
+            header,
             text="🔧 Configuration",
-            font=("Arial", 12, "bold"),
+            font=("Arial", 11, "bold"),
             bg=self.colors['card_bg'],
             fg=self.colors['accent']
-        ).pack(anchor='w')
+        ).pack(side='left')
 
-        # LiveKit settings
-        lk_frame = tk.Frame(config_frame, bg=self.colors['card_bg'])
-        lk_frame.pack(fill='x', pady=5)
+        self.config_visible = True
+        toggle_btn = tk.Label(
+            header,
+            text="−",
+            font=("Arial", 12, "bold"),
+            bg=self.colors['card_bg'],
+            fg=self.colors['muted'],
+            cursor="hand2"
+        )
+        toggle_btn.pack(side='right')
+        toggle_btn.bind("<Button-1>", lambda e: self._toggle_section("config"))
 
-        tk.Label(lk_frame, text="LiveKit URL:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=0, column=0, sticky='w')
-        self.livekit_url = tk.Entry(lk_frame, bg="#3a3a5e", fg="white", insertbackground='white')
-        self.livekit_url.grid(row=0, column=1, sticky='ew', padx=5)
+        self.config_content = tk.Frame(config_frame, bg=self.colors['card_bg'])
+        self.config_content.pack(fill='x', pady=10)
 
-        tk.Label(lk_frame, text="API Key:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=0, column=2, sticky='w')
-        self.api_key = tk.Entry(lk_frame, bg="#3a3a5e", fg="white", insertbackground='white', show='*')
-        self.api_key.grid(row=0, column=3, sticky='ew', padx=5)
+        # LiveKit settings (compact)
+        lk_frame = tk.Frame(self.config_content, bg=self.colors['card_bg'])
+        lk_frame.pack(fill='x', pady=3)
 
-        tk.Label(lk_frame, text="API Secret:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=1, column=0, sticky='w')
-        self.api_secret = tk.Entry(lk_frame, bg="#3a3a5e", fg="white", insertbackground='white', show='*')
-        self.api_secret.grid(row=1, column=1, sticky='ew', padx=5)
+        tk.Label(lk_frame, text="URL:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=5, anchor='w').grid(row=0, column=0, sticky='w')
+        self.livekit_url = tk.Entry(lk_frame, bg="#2a2a4e", fg="white", insertbackground='white', font=("Arial", 9))
+        self.livekit_url.grid(row=0, column=1, sticky='ew', padx=2)
 
-        tk.Label(lk_frame, text="Room Name:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=1, column=2, sticky='w')
-        self.room_name = tk.Entry(lk_frame, bg="#3a3a5e", fg="white", insertbackground='white')
-        self.room_name.grid(row=1, column=3, sticky='ew', padx=5)
+        tk.Label(lk_frame, text="Key:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=2, sticky='w')
+        self.api_key = tk.Entry(lk_frame, bg="#2a2a4e", fg="white", insertbackground='white', show='*', font=("Arial", 9))
+        self.api_key.grid(row=0, column=3, sticky='ew', padx=2)
+
+        tk.Label(lk_frame, text="Secret:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=6, anchor='w').grid(row=0, column=4, sticky='w')
+        self.api_secret = tk.Entry(lk_frame, bg="#2a2a4e", fg="white", insertbackground='white', show='*', font=("Arial", 9))
+        self.api_secret.grid(row=0, column=5, sticky='ew', padx=2)
+
+        tk.Label(lk_frame, text="Room:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=5, anchor='w').grid(row=1, column=0, sticky='w')
+        self.room_name = tk.Entry(lk_frame, bg="#2a2a4e", fg="white", insertbackground='white', font=("Arial", 9))
+        self.room_name.grid(row=1, column=1, sticky='ew', padx=2)
 
         lk_frame.columnconfigure(1, weight=1)
         lk_frame.columnconfigure(3, weight=1)
+        lk_frame.columnconfigure(5, weight=1)
 
         # Provider settings
-        provider_frame = tk.Frame(config_frame, bg=self.colors['card_bg'])
-        provider_frame.pack(fill='x', pady=5)
+        provider_frame = tk.Frame(self.config_content, bg=self.colors['card_bg'])
+        provider_frame.pack(fill='x', pady=3)
 
-        tk.Label(provider_frame, text="LLM Provider:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=0, column=0, sticky='w')
+        tk.Label(provider_frame, text="LLM:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=0, sticky='w')
         self.llm_provider = ttk.Combobox(provider_frame, values=[
             "openai/gpt-4o-mini",
             "openai/gpt-4o",
             "openai/o3-mini",
             "anthropic/claude-3-haiku",
             "anthropic/claude-3.5-sonnet",
-        ], state='readonly')
+        ], state='readonly', font=("Arial", 9))
         self.llm_provider.set("openai/gpt-4o-mini")
-        self.llm_provider.grid(row=0, column=1, sticky='ew', padx=5)
+        self.llm_provider.grid(row=0, column=1, sticky='ew', padx=2)
 
-        tk.Label(provider_frame, text="STT Provider:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=0, column=2, sticky='w')
+        tk.Label(provider_frame, text="STT:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=2, sticky='w')
         self.stt_provider = ttk.Combobox(provider_frame, values=[
             "deepgram/nova-2",
             "deepgram/nova-3",
-        ], state='readonly')
+        ], state='readonly', font=("Arial", 9))
         self.stt_provider.set("deepgram/nova-2")
-        self.stt_provider.grid(row=0, column=3, sticky='ew', padx=5)
+        self.stt_provider.grid(row=0, column=3, sticky='ew', padx=2)
 
-        tk.Label(provider_frame, text="TTS Provider:", bg=self.colors['card_bg'], fg=self.colors['text'], width=15, anchor='w').grid(row=1, column=0, sticky='w')
+        tk.Label(provider_frame, text="TTS:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=4, sticky='w')
         self.tts_provider = ttk.Combobox(provider_frame, values=[
             "cartesia/sonic-english",
             "cartesia/sonic-2",
             "elevenlabs/turbo-2",
-        ], state='readonly')
+        ], state='readonly', font=("Arial", 9))
         self.tts_provider.set("cartesia/sonic-english")
-        self.tts_provider.grid(row=1, column=1, sticky='ew', padx=5)
+        self.tts_provider.grid(row=0, column=5, sticky='ew', padx=2)
 
         provider_frame.columnconfigure(1, weight=1)
         provider_frame.columnconfigure(3, weight=1)
+        provider_frame.columnconfigure(5, weight=1)
 
-    def _build_status_panel(self):
+    def _build_features_panel(self, parent):
+        """Build the features panel with checkboxes."""
+        features_frame = tk.Frame(parent, bg=self.colors['card_bg_alt'], padx=15, pady=12)
+        features_frame.pack(fill='x', padx=(0, 5), pady=5)
+
+        # Header
+        header = tk.Frame(features_frame, bg=self.colors['card_bg_alt'])
+        header.pack(fill='x')
+
+        tk.Label(
+            header,
+            text="⚙️ Demo Features",
+            font=("Arial", 11, "bold"),
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['accent2']
+        ).pack(side='left')
+
+        self.feature_vars = {}
+
+        # Checkboxes grid
+        checkbox_frame = tk.Frame(features_frame, bg=self.colors['card_bg_alt'])
+        checkbox_frame.pack(fill='x', pady=10)
+
+        for i, (attr, label, tooltip) in enumerate(self.CHECKBOXES):
+            var = tk.BooleanVar(value=getattr(demo_features, attr, False))
+            self.feature_vars[attr] = var
+
+            row = i // 2
+            col = i % 2
+
+            cb = tk.Checkbutton(
+                checkbox_frame,
+                text=label,
+                variable=var,
+                bg=self.colors['card_bg_alt'],
+                fg=self.colors['text'],
+                selectcolor=self.colors['card_bg'],
+                activebackground=self.colors['card_bg_alt'],
+                activeforeground=self.colors['accent'],
+                cursor="hand2",
+                font=("Arial", 9),
+                command=lambda a=attr, v=var: self._toggle_feature(a, v.get())
+            )
+            cb.grid(row=row, column=col, sticky='w', padx=5, pady=2)
+
+            # Store reference for tooltip
+            cb.tooltip_text = tooltip
+
+        # Latency slider (only enabled when simulated_latency is on)
+        latency_frame = tk.Frame(features_frame, bg=self.colors['card_bg_alt'])
+        latency_frame.pack(fill='x', pady=5)
+
+        tk.Label(
+            latency_frame,
+            text="Latency:",
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['muted'],
+            font=("Arial", 9)
+        ).pack(side='left')
+
+        self.latency_slider = tk.Scale(
+            latency_frame,
+            from_=0,
+            to=3000,
+            orient='horizontal',
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['text'],
+            highlightthickness=0,
+            length=200,
+            showvalue=0,
+            command=self._update_latency
+        )
+        self.latency_slider.set(1000)
+        self.latency_slider.pack(side='left', padx=5)
+        self.latency_slider.config(state='disabled')
+
+        self.latency_label = tk.Label(
+            latency_frame,
+            text="1000ms",
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['muted'],
+            font=("Arial", 9),
+            width=6
+        )
+        self.latency_label.pack(side='left')
+
+    def _build_status_panel(self, parent):
         """Build the status and control panel."""
-        status_frame = tk.Frame(self.root, bg=self.colors['card_bg'], padx=20, pady=15)
-        status_frame.pack(fill='x', padx=10, pady=10)
+        status_frame = tk.Frame(parent, bg=self.colors['card_bg'], padx=15, pady=12)
+        status_frame.pack(fill='x', padx=(0, 5), pady=5)
 
         tk.Label(
             status_frame,
             text="📊 Session Status",
-            font=("Arial", 12, "bold"),
+            font=("Arial", 11, "bold"),
             bg=self.colors['card_bg'],
             fg=self.colors['accent']
         ).pack(anchor='w')
 
-        # Status indicator
-        self.status_container = tk.Frame(status_frame, bg=self.colors['card_bg'])
-        self.status_container.pack(pady=10)
+        # Status row
+        status_row = tk.Frame(status_frame, bg=self.colors['card_bg'])
+        status_row.pack(pady=8)
 
+        # Status dot
         self.status_dot = tk.Canvas(
-            self.status_container,
-            width=20,
-            height=20,
+            status_row,
+            width=24,
+            height=24,
             bg=self.colors['card_bg'],
             highlightthickness=0
         )
-        self.status_dot.grid(row=0, column=0, padx=10)
+        self.status_dot.pack(side='left', padx=10)
         self._draw_status_dot('#555555')
 
+        # Status text
         self.status_text = tk.Label(
-            self.status_container,
+            status_row,
             text="Disconnected",
-            font=("Arial", 14),
+            font=("Arial", 13, "bold"),
             bg=self.colors['card_bg'],
             fg="#ffffff"
         )
-        self.status_text.grid(row=0, column=1)
+        self.status_text.pack(side='left')
+
+        # Agent mood indicator
+        self.mood_label = tk.Label(
+            status_row,
+            text="😊 friendly",
+            font=("Arial", 10),
+            bg=self.colors['card_bg'],
+            fg=self.colors['muted']
+        )
+        self.mood_label.pack(side='left', padx=20)
 
         # Control buttons
         button_frame = tk.Frame(status_frame, bg=self.colors['card_bg'])
-        button_frame.pack(pady=10)
+        button_frame.pack(pady=8)
 
         self.start_btn = tk.Button(
             button_frame,
-            text="🎤 START",
-            font=("Arial", 14, "bold"),
-            bg=self.colors['accent'],
-            fg="white",
-            width=15,
-            height=2,
+            text="▶ START",
+            font=("Arial", 13, "bold"),
+            bg=self.colors['success'],
+            fg="#0d0d1a",
+            width=12,
+            height=1,
             cursor="hand2",
-            command=self.start_session
+            command=self.start_session,
+            relief='flat',
+            bd=0
         )
-        self.start_btn.pack(side='left', padx=10)
+        self.start_btn.pack(side='left', padx=8)
 
         self.stop_btn = tk.Button(
             button_frame,
-            text="⏹ STOP",
-            font=("Arial", 16, "bold"),
+            text="■ STOP",
+            font=("Arial", 14, "bold"),
             bg=self.colors['danger'],
             fg="white",
-            width=15,
-            height=2,
+            width=12,
+            height=1,
             cursor="hand2",
             command=self.stop_session,
+            relief='flat',
+            bd=0,
             state='disabled'
         )
-        self.stop_btn.pack(side='left', padx=10)
+        self.stop_btn.pack(side='left', padx=8)
 
-    def _build_log_panel(self):
+    def _build_visualization_panel(self, parent):
+        """Build visualization panels (timeline and audio meter)."""
+        viz_frame = tk.Frame(parent, bg=self.colors['card_bg_alt'], padx=15, pady=12)
+        viz_frame.pack(fill='x', padx=(0, 5), pady=5)
+
+        # Timeline
+        tk.Label(
+            viz_frame,
+            text="📈 Tool Timeline (last 10s)",
+            font=("Arial", 9, "bold"),
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['muted']
+        ).pack(anchor='w')
+
+        self.timeline_canvas = tk.Canvas(
+            viz_frame,
+            width=500,
+            height=60,
+            bg="#0d0d1a",
+            highlightthickness=1,
+            highlightbackground=self.colors['card_bg']
+        )
+        self.timeline_canvas.pack(fill='x', pady=5)
+
+        # Audio meter and timer
+        meter_row = tk.Frame(viz_frame, bg=self.colors['card_bg_alt'])
+        meter_row.pack(fill='x', pady=5)
+
+        tk.Label(
+            meter_row,
+            text="🔊 Audio Level:",
+            font=("Arial", 9),
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['muted']
+        ).pack(side='left')
+
+        self.audio_canvas = tk.Canvas(
+            meter_row,
+            width=200,
+            height=40,
+            bg="#0d0d1a",
+            highlightthickness=1,
+            highlightbackground=self.colors['card_bg']
+        )
+        self.audio_canvas.pack(side='left', padx=5)
+
+        self.session_timer = tk.Label(
+            meter_row,
+            text="00:00",
+            font=("Consolas", 14, "bold"),
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['accent']
+        )
+        self.session_timer.pack(side='right')
+
+    def _build_stats_panel(self, parent):
+        """Build the statistics panel."""
+        stats_frame = tk.Frame(parent, bg=self.colors['card_bg'], padx=15, pady=12)
+        stats_frame.pack(fill='x', pady=5)
+
+        tk.Label(
+            stats_frame,
+            text="📊 Session Statistics",
+            font=("Arial", 11, "bold"),
+            bg=self.colors['card_bg'],
+            fg=self.colors['accent']
+        ).pack(anchor='w')
+
+        # Stats grid
+        self.stats_labels = {}
+        stats_grid = tk.Frame(stats_frame, bg=self.colors['card_bg'])
+        stats_grid.pack(fill='x', pady=8)
+
+        stats = [
+            ("duration", "Duration", "00:00"),
+            ("tool_calls", "Tool Calls", "0"),
+            ("avg_latency", "Avg Latency", "0ms"),
+            ("user_msgs", "User Messages", "0"),
+            ("agent_resp", "Agent Responses", "0"),
+        ]
+
+        for i, (key, label, default) in enumerate(stats):
+            row = i // 3
+            col = i % 3
+
+            lbl_frame = tk.Frame(stats_grid, bg="#2a2a4e", padx=8, pady=5)
+            lbl_frame.grid(row=row, column=col, padx=3, pady=3, sticky='ew')
+
+            tk.Label(
+                lbl_frame,
+                text=label,
+                font=("Arial", 8),
+                bg="#2a2a4e",
+                fg=self.colors['muted']
+            ).pack()
+
+            val_label = tk.Label(
+                lbl_frame,
+                text=default,
+                font=("Arial", 12, "bold"),
+                bg="#2a2a4e",
+                fg=self.colors['accent']
+            )
+            val_label.pack()
+            self.stats_labels[key] = val_label
+
+        # Mood selection
+        mood_frame = tk.Frame(stats_frame, bg=self.colors['card_bg'])
+        mood_frame.pack(fill='x', pady=5)
+
+        tk.Label(
+            mood_frame,
+            text="Agent Mood:",
+            font=("Arial", 9),
+            bg=self.colors['card_bg'],
+            fg=self.colors['muted']
+        ).pack(side='left')
+
+        self.mood_var = tk.StringVar(value="friendly")
+        moods = ["friendly", "professional", "playful", "terse"]
+        for mood in moods:
+            rb = tk.Radiobutton(
+                mood_frame,
+                text=mood.capitalize(),
+                variable=self.mood_var,
+                value=mood,
+                bg=self.colors['card_bg'],
+                fg=self.colors['text'],
+                selectcolor="#2a2a4e",
+                activebackground=self.colors['card_bg'],
+                font=("Arial", 8),
+                command=self._change_mood
+            )
+            rb.pack(side='left', padx=5)
+
+    def _build_log_panel(self, parent):
         """Build the conversation log panel."""
-        log_frame = tk.Frame(self.root, bg=self.colors['card_bg'], padx=20, pady=15)
-        log_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        log_frame = tk.Frame(parent, bg=self.colors['card_bg'], padx=15, pady=12)
+        log_frame.pack(fill='both', expand=True, pady=5)
 
         tk.Label(
             log_frame,
             text="💬 Conversation Log",
-            font=("Arial", 12, "bold"),
+            font=("Arial", 11, "bold"),
             bg=self.colors['card_bg'],
             fg=self.colors['accent']
         ).pack(anchor='w')
 
-        # Log text widget with scrollbar
+        # Log container
         log_container = tk.Frame(log_frame, bg=self.colors['card_bg'])
-        log_container.pack(fill='both', expand=True, pady=10)
+        log_container.pack(fill='both', expand=True, pady=8)
 
-        scrollbar = tk.Scrollbar(log_container, bg="#3a3a5e")
+        scrollbar = tk.Scrollbar(log_container, bg="#2a2a4e")
         scrollbar.pack(side='right', fill='y')
 
         self.log_text = tk.Text(
             log_container,
-            bg="#0a0a1e",
+            bg="#0a0a14",
             fg="#00ff88",
-            font=("Consolas", 10),
+            font=("Consolas", 9),
             yscrollcommand=scrollbar.set,
             insertbackground='white',
             relief='flat',
-            padx=10,
-            pady=10
+            padx=8,
+            pady=8,
+            wrap='word'
         )
         self.log_text.pack(fill='both', expand=True)
         scrollbar.config(command=self.log_text.yview)
 
-        # Configure tags for different log types
-        self.log_text.tag_config('system', foreground='#888888')
+        # Configure tags
+        self.log_text.tag_config('system', foreground='#666688')
         self.log_text.tag_config('user', foreground='#4a9eff')
         self.log_text.tag_config('agent', foreground='#00ff88')
         self.log_text.tag_config('tool', foreground='#ff6b6b')
         self.log_text.tag_config('error', foreground='#ff4757')
+        self.log_text.tag_config('debug', foreground='#ffd93d')
+        self.log_text.tag_config('timestamp', foreground='#444466')
 
-        self.log("System", "Ready to start. Configure your settings above and click START.", "system")
+        self.log("System", "Ready. Configure settings and click START.", "system")
 
-        # Clear button
-        clear_btn = tk.Button(
-            log_frame,
-            text="Clear Log",
-            font=("Arial", 10),
-            bg="#3a3a5e",
+        # Clear and Export buttons
+        btn_row = tk.Frame(log_frame, bg=self.colors['card_bg'])
+        btn_row.pack(fill='x')
+
+        tk.Button(
+            btn_row,
+            text="Clear",
+            font=("Arial", 9),
+            bg="#2a2a4e",
             fg="white",
             cursor="hand2",
             command=self.clear_log
-        )
-        clear_btn.pack(anchor='e')
+        ).pack(side='left', padx=5)
 
-    def _build_quick_actions(self):
-        """Build quick action buttons for testing."""
-        actions_frame = tk.Frame(self.root, bg=self.colors['card_bg'], padx=20, pady=15)
-        actions_frame.pack(fill='x', padx=10, pady=10)
+        tk.Button(
+            btn_row,
+            text="Export",
+            font=("Arial", 9),
+            bg="#2a2a4e",
+            fg="white",
+            cursor="hand2",
+            command=self.export_log
+        ).pack(side='left', padx=5)
+
+    def _build_quick_actions(self, parent):
+        """Build quick action buttons."""
+        actions_frame = tk.Frame(parent, bg=self.colors['card_bg_alt'], padx=15, pady=12)
+        actions_frame.pack(fill='x', pady=5)
 
         tk.Label(
             actions_frame,
-            text="⚡ Quick Test Actions (click to speak)",
-            font=("Arial", 12, "bold"),
-            bg=self.colors['card_bg'],
-            fg=self.colors['accent']
+            text="⚡ Quick Test Actions",
+            font=("Arial", 11, "bold"),
+            bg=self.colors['card_bg_alt'],
+            fg=self.colors['accent2']
         ).pack(anchor='w')
 
-        buttons_frame = tk.Frame(actions_frame, bg=self.colors['card_bg'])
-        buttons_frame.pack(fill='x', pady=10)
+        buttons_frame = tk.Frame(actions_frame, bg=self.colors['card_bg_alt'])
+        buttons_frame.pack(fill='x', pady=8)
 
         actions = [
-            ("What time is it?", "get_current_time"),
-            ("Flip a coin", "flip_coin"),
-            ("Roll d20", "roll_dice"),
-            ("Weather in Tokyo", "get_weather"),
-            ("234 * 567", "calculator"),
-            ("Search AI trends", "web_search"),
-            ("Sentiment: I love this", "analyze_text"),
+            ("What time is it?", "🕐"),
+            ("Flip a coin", "🪙"),
+            ("Roll d20", "🎲"),
+            ("Weather in Tokyo", "🌤️"),
+            ("234 * 567", "🔢"),
+            ("Search AI trends", "🔍"),
+            ("Set mood: playful", "😄"),
+            ("Get session stats", "📊"),
         ]
 
-        for i, (label, tool) in enumerate(actions):
+        for i, (label, emoji) in enumerate(actions):
             btn = tk.Button(
                 buttons_frame,
-                text=label,
-                font=("Arial", 10),
-                bg="#3a3a5e",
+                text=f"{emoji} {label}",
+                font=("Arial", 8),
+                bg="#2a2a4e",
                 fg="white",
                 cursor="hand2",
+                relief='flat',
                 command=lambda l=label: self.speak_test(l)
             )
-            btn.grid(row=i//4, column=i%4, padx=5, pady=5, sticky='ew')
+            btn.grid(row=i//4, column=i%4, padx=3, pady=3, sticky='ew')
 
-        buttons_frame.columnconfigure(0, weight=1)
-        buttons_frame.columnconfigure(1, weight=1)
-        buttons_frame.columnconfigure(2, weight=1)
-        buttons_frame.columnconfigure(3, weight=1)
+        for i in range(4):
+            buttons_frame.columnconfigure(i, weight=1)
+
+    # ============================================================================
+    # UI HELPERS
+    # ============================================================================
+
+    def _toggle_section(self, section):
+        if section == "config":
+            self.config_visible = not self.config_visible
+            if self.config_visible:
+                self.config_content.pack(fill='x', pady=10)
+            else:
+                self.config_content.pack_forget()
 
     def _draw_status_dot(self, color):
-        """Draw the status indicator dot."""
         self.status_dot.delete("all")
-        self.status_dot.create_oval(2, 2, 18, 18, fill=color, outline="")
+        self.status_dot.create_oval(2, 2, 22, 22, fill=color, outline="")
+        # Add glow effect
+        self.status_dot.create_oval(4, 4, 20, 20, fill=color, outline="", stipple="gray50")
+
+    def _toggle_feature(self, attr, value):
+        setattr(demo_features, attr, value)
+
+        # Special handling for simulated latency
+        if attr == "simulated_latency":
+            state = 'normal' if value else 'disabled'
+            self.latency_slider.config(state=state)
+
+        if attr == "audio_level_meter":
+            if value and self.is_running:
+                self.audio_meter.start()
+            else:
+                self.audio_meter.stop()
+
+        if attr == "tool_timeline" and not value:
+            self.timeline_canvas.delete("all")
+            self.timeline.entries = []
+
+        self.log("Debug", f"Feature '{attr}' set to {value}", "debug")
+
+    def _update_latency(self, value):
+        demo_features.latency_ms = int(value)
+        self.latency_label.config(text=f"{int(value)}ms")
+
+    def _change_mood(self):
+        self.agent_mood = self.mood_var.get()
+        mood_emojis = {"friendly": "😊", "professional": "👔", "playful": "😄", "terse": "😐"}
+        self.mood_label.config(text=f"{mood_emojis.get(self.agent_mood, '😊')} {self.agent_mood}")
+
+    def _update_ui(self):
+        """Update UI elements periodically."""
+        if self.is_running and self.session_start_time:
+            # Update timer
+            elapsed = int(time.time() - self.session_start_time)
+            mins, secs = divmod(elapsed, 60)
+            self.session_timer.config(text=f"{mins:02d}:{secs:02d}")
+            self.stats_labels["duration"].config(text=f"{mins:02d}:{secs:02d}")
+
+        self.root.after(100, self._update_ui)
+
+    # ============================================================================
+    # LOGGING
+    # ============================================================================
+
+    def log(self, source, message, tag='system'):
+        if not demo_features.debug_mode and tag == 'debug':
+            return
+
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self.log_text.insert('end', f"[{timestamp}] ", 'timestamp')
+        self.log_text.insert('end', f"{source}: ", tag)
+        self.log_text.insert('end', f"{message}\n")
+        self.log_text.see('end')
+
+    def log_tool_execution(self, tool_name, args, result, duration_ms, is_error=False):
+        """Log tool execution with configurable verbosity."""
+        tag = 'error' if is_error else 'tool'
+
+        if demo_features.verbose_tool_logging:
+            args_str = str(args) if args else "no args"
+            self.log("Tool", f"{tool_name}({args_str}) -> {result} ({duration_ms:.0f}ms)", tag)
+        else:
+            self.log("Tool", f"{tool_name} -> {duration_ms:.0f}ms", tag)
+
+        # Update stats
+        self.tool_calls.append({"tool": tool_name, "duration": duration_ms, "time": time.time()})
+        avg_latency = sum(t["duration"] for t in self.tool_calls) / len(self.tool_calls) if self.tool_calls else 0
+        self.stats_labels["tool_calls"].config(text=str(len(self.tool_calls)))
+        self.stats_labels["avg_latency"].config(text=f"{avg_latency:.0f}ms")
+
+        # Sound effect
+        if demo_features.sound_effects and not is_error:
+            self._play_sound(duration_ms)
+
+    def clear_log(self):
+        self.log_text.delete(1.0, 'end')
+
+    def export_log(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if filename:
+            with open(filename, 'w') as f:
+                f.write(self.log_text.get(1.0, 'end'))
+
+    def _play_sound(self, duration_ms):
+        """Play a subtle sound based on tool duration."""
+        # Visual feedback instead of audio for simplicity
+        pass
+
+    # ============================================================================
+    # CONFIG
+    # ============================================================================
 
     def _load_config(self):
-        """Load saved configuration."""
-        import json
         try:
             with open('config.json', 'r') as f:
                 config = json.load(f)
@@ -610,12 +1356,18 @@ class VoiceAgentGUI:
                 self.llm_provider.set(config.get('llm_provider', 'openai/gpt-4o-mini'))
                 self.stt_provider.set(config.get('stt_provider', 'deepgram/nova-2'))
                 self.tts_provider.set(config.get('tts_provider', 'cartesia/sonic-english'))
+
+                # Load demo features
+                if 'demo_features' in config:
+                    demo_features.from_dict(config['demo_features'])
+                    for attr, var in self.feature_vars.items():
+                        var.set(getattr(demo_features, attr, False))
+                    self.latency_slider.set(demo_features.latency_ms)
+
         except FileNotFoundError:
             self.room_name.insert(0, 'voice-agent-test')
 
     def _save_config(self):
-        """Save current configuration."""
-        import json
         config = {
             'livekit_url': self.livekit_url.get(),
             'api_key': self.api_key.get(),
@@ -624,41 +1376,21 @@ class VoiceAgentGUI:
             'llm_provider': self.llm_provider.get(),
             'stt_provider': self.stt_provider.get(),
             'tts_provider': self.tts_provider.get(),
+            'demo_features': demo_features.to_dict(),
         }
         with open('config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
-    def log(self, source, message, tag='system'):
-        """Add a log entry."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert('end', f"[{timestamp}] ", 'system')
-        self.log_text.insert('end', f"{source}: ", tag)
-        self.log_text.insert('end', f"{message}\n")
-        self.log_text.see('end')
-
-    def log_tool(self, message):
-        """Log a tool execution from the agent."""
-        self.log("Tool", message, "tool")
-
-    def log_user(self, message):
-        """Log a user message."""
-        self.log("User", message, "user")
-
-    def log_agent(self, message):
-        """Log an agent message."""
-        self.log("Agent", message, "agent")
-
-    def clear_log(self):
-        """Clear the log."""
-        self.log_text.delete(1.0, 'end')
+    # ============================================================================
+    # SESSION MANAGEMENT
+    # ============================================================================
 
     def set_status(self, status, text, color):
-        """Update the status indicator."""
+        self.current_status = status
         self.root.after(0, lambda: self._draw_status_dot(color))
         self.root.after(0, lambda: self.status_text.config(text=text))
 
     def start_session(self):
-        """Start the voice session."""
         self._save_config()
 
         livekit_url = self.livekit_url.get()
@@ -670,18 +1402,30 @@ class VoiceAgentGUI:
             return
 
         self.is_running = True
+        self.session_start_time = time.time()
+        self.tool_calls = []
+        self.user_messages = []
+        self.agent_responses = []
+
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self.set_status('connecting', 'Connecting...', '#ffa500')
 
         self.log("System", "Starting voice session...", "system")
 
-        # Run the agent in the asyncio thread
+        # Reset timeline
+        if demo_features.tool_timeline:
+            self.timeline.reset()
+
+        # Start audio meter
+        if demo_features.audio_level_meter:
+            self.audio_meter.start()
+
+        # Run the agent
         async def run_agent():
             try:
                 from livekit import rtc
 
-                # Create room
                 room = rtc.Room()
                 await room.connect(
                     livekit_url,
@@ -689,11 +1433,18 @@ class VoiceAgentGUI:
                 )
 
                 self.set_status('listening', 'Listening', '#00ff88')
-                self.log("System", "Connected to room. Listening...", "system")
+                self.log("System", "Connected. Listening...", "system")
 
-                # Keep running until stopped
+                # Auto greeting
+                if demo_features.auto_greeting:
+                    self.log("System", "Sending auto-greeting...", "debug")
+
                 while self.is_running:
                     await asyncio.sleep(0.1)
+
+                # Summary
+                if demo_features.conversation_summary:
+                    self._show_summary()
 
                 await room.disconnect()
 
@@ -702,14 +1453,12 @@ class VoiceAgentGUI:
                 self.set_status('disconnected', 'Connection Failed', '#ff4757')
                 self.start_btn.config(state='normal')
                 self.stop_btn.config(state='disabled')
+                self.audio_meter.stop()
 
         async_runner.run_coroutine(run_agent())
 
     def _create_token(self, api_key, api_secret, room_name):
-        """Create a JWT token for LiveKit."""
         from livekit import api
-        import time
-
         token = api.AccessToken(api_key, api_secret) \
             .with_identity("user") \
             .with_name("User") \
@@ -720,29 +1469,51 @@ class VoiceAgentGUI:
                 can_subscribe=True,
             )) \
             .with_validity(int(time.time()) + 3600)
-
         return token.to_jwt()
 
     def stop_session(self):
-        """Stop the voice session."""
         self.is_running = False
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.set_status('disconnected', 'Disconnected', '#555555')
+        self.audio_meter.stop()
         self.log("System", "Session ended.", "system")
 
     def speak_test(self, text):
-        """Send a test phrase."""
         if self.is_running:
-            self.log_user(text)
-            # This would send text to the agent via data channel
-            # For console mode, just log it
+            self.user_messages.append({"text": text, "time": time.time()})
+            self.stats_labels["user_msgs"].config(text=str(len(self.user_messages)))
+            self.log("User", text, "user")
         else:
-            self.log("System", "Please start the session first", "system")
+            self.log("System", "Start session first", "system")
+
+    def get_session_stats(self):
+        return {
+            "duration_seconds": int(time.time() - self.session_start_time) if self.session_start_time else 0,
+            "tool_calls": len(self.tool_calls),
+            "user_messages": len(self.user_messages),
+            "agent_responses": len(self.agent_responses),
+            "avg_latency": sum(t["duration"] for t in self.tool_calls) / len(self.tool_calls) if self.tool_calls else 0,
+        }
+
+    def _show_summary(self):
+        stats = self.get_session_stats()
+        summary = f"""
+╔═══════════════════════════════╗
+║      SESSION SUMMARY          ║
+╠═══════════════════════════════╣
+║ Duration: {stats['duration_seconds']:>4}s              ║
+║ Tool Calls: {stats['tool_calls']:>4}              ║
+║ User Messages: {stats['user_messages']:>4}              ║
+║ Agent Responses: {stats['agent_responses']:>4}              ║
+║ Avg Latency: {stats['avg_latency']:>4.0f}ms           ║
+╚═══════════════════════════════╝
+"""
+        self.log("Summary", summary.strip(), "system")
 
 
 # ============================================================================
-# CONSOLE MODE (for testing without GUI)
+# CONSOLE MODE
 # ============================================================================
 
 async def console_entrypoint(ctx: JobContext) -> None:
@@ -750,6 +1521,7 @@ async def console_entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     global gui_instance
+    gui_instance = ConsoleLogger()
 
     llm_provider = os.getenv("DEFAULT_LLM", "openai/gpt-4o-mini")
     stt_provider = os.getenv("DEFAULT_STT", "deepgram/nova-2")
@@ -774,8 +1546,9 @@ async def console_entrypoint(ctx: JobContext) -> None:
 
 class ConsoleLogger:
     """Simple console logger for tool calls."""
-    def log_tool(self, message):
-        print(f"[TOOL] {message}")
+    def log_tool_execution(self, tool_name, args, result, duration_ms, is_error=False):
+        tag = 'ERROR' if is_error else 'TOOL'
+        print(f"[{tag}] {tool_name}({args}) -> {result} ({duration_ms:.0f}ms)")
 
 
 # ============================================================================
@@ -783,16 +1556,13 @@ class ConsoleLogger:
 # ============================================================================
 
 def main():
-    """Main entry point."""
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "console":
-        # Console mode for testing
         global gui_instance
         gui_instance = ConsoleLogger()
         cli.run_app(WorkerOptions(entrypoint_fnc=console_entrypoint))
     else:
-        # GUI mode
         root = tk.Tk()
         app = VoiceAgentGUI(root)
 
