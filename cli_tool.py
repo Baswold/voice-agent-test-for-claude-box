@@ -49,33 +49,56 @@ class CLIConfig:
     """Configuration from CLI arguments and environment variables."""
 
     def __init__(self, args=None):
-        # Demo features (default to False for CLI unless specified)
-        self.verbose_tool_logging = getattr(args, 'verbose_tool_logging', False)
-        self.auto_greeting = getattr(args, 'auto_greeting', False)
-        self.simulated_latency = getattr(args, 'simulated_latency', False)
-        self.latency_ms = getattr(args, 'latency_ms', 1000)
-        self.sound_effects = getattr(args, 'sound_effects', False)
-        self.tool_timeline = getattr(args, 'tool_timeline', False)
-        self.transcript_mode = getattr(args, 'transcript_mode', False)
-        self.debug_mode = getattr(args, 'debug_mode', False)
-        self.announcement_mode = getattr(args, 'announcement_mode', False)
-        self.conversation_summary = getattr(args, 'conversation_summary', True)
-        self.mock_mode = getattr(args, 'mock_mode', False)
+        if args is None:
+            args = type('Args', (), {})()
+
+        # Helper to get value with env var fallback
+        def get_val(attr_name, env_var=None, default=False, val_type=str):
+            val = getattr(args, attr_name, None)
+            if val is not None:
+                return val
+            if env_var:
+                env_val = os.getenv(env_var)
+                if env_val is not None:
+                    if val_type == bool:
+                        return env_val.lower() == 'true'
+                    elif val_type == int:
+                        return int(env_val)
+                    return env_val
+            return default
+
+        # Demo features - check CLI args first, then env vars, then defaults
+        self.verbose_tool_logging = get_val('verbose_tool_logging', 'VERBOSE_TOOL_LOGGING')
+        self.auto_greeting = get_val('auto_greeting', 'AUTO_GREETING')
+        self.simulated_latency = get_val('simulated_latency', 'SIMULATED_LATENCY')
+        self.latency_ms = get_val('latency_ms', 'LATENCY_MS', default=1000, val_type=int)
+        self.sound_effects = get_val('sound_effects', 'SOUND_EFFECTS')
+        self.tool_timeline = get_val('tool_timeline', 'TOOL_TIMELINE')
+        self.transcript_mode = get_val('transcript_mode', 'TRANSCRIPT_MODE')
+        self.debug_mode = get_val('debug_mode', 'DEBUG_MODE')
+        self.announcement_mode = get_val('announcement_mode', 'ANNOUNCEMENT_MODE')
+        # Handle no_summary flag (inverse of conversation_summary)
+        no_summary = get_val('no_summary', None)
+        if no_summary is not None:
+            self.conversation_summary = not no_summary
+        else:
+            self.conversation_summary = get_val('conversation_summary', 'CONVERSATION_SUMMARY', default=True, val_type=bool)
+        self.mock_mode = get_val('mock_mode', 'MOCK_MODE', val_type=bool)
 
         # Connection settings
-        self.livekit_url = getattr(args, 'livekit_url', os.getenv('LIVEKIT_URL', ''))
-        self.api_key = getattr(args, 'api_key', os.getenv('LIVEKIT_API_KEY', ''))
-        self.api_secret = getattr(args, 'api_secret', os.getenv('LIVEKIT_API_SECRET', ''))
-        self.room_name = getattr(args, 'room_name', os.getenv('ROOM_NAME', 'voice-agent-test'))
+        self.livekit_url = get_val('livekit_url', 'LIVEKIT_URL', default='')
+        self.api_key = get_val('api_key', 'LIVEKIT_API_KEY', default='')
+        self.api_secret = get_val('api_secret', 'LIVEKIT_API_SECRET', default='')
+        self.room_name = get_val('room_name', 'ROOM_NAME', default='voice-agent-test')
 
         # Provider settings
-        self.llm_provider = getattr(args, 'llm', os.getenv('DEFAULT_LLM', 'openai/gpt-4o-mini'))
-        self.stt_provider = getattr(args, 'stt', os.getenv('DEFAULT_STT', 'local/whisper-base'))
-        self.tts_provider = getattr(args, 'tts', os.getenv('DEFAULT_TTS', 'local/macos'))
+        self.llm_provider = get_val('llm', 'DEFAULT_LLM', default='openai/gpt-4o-mini')
+        self.stt_provider = get_val('stt', 'DEFAULT_STT', default='local/whisper-base')
+        self.tts_provider = get_val('tts', 'DEFAULT_TTS', default='local/macos')
 
         # Agent settings
-        self.agent_mood = getattr(args, 'mood', 'friendly')
-        self.timeout = getattr(args, 'timeout', 300)  # 5 minutes default
+        self.agent_mood = get_val('mood', 'AGENT_MOOD', default='friendly')
+        self.timeout = get_val('timeout', 'SESSION_TIMEOUT', default=300, val_type=int)
         self.input_file = getattr(args, 'input_file', None)
 
         # Output settings
@@ -855,30 +878,30 @@ Examples:
     # Common arguments
     def add_common_args(subparser):
         """Add common arguments to a subparser."""
-        subparser.add_argument('--livekit-url', help='LiveKit URL (default: from LIVEKIT_URL env var)')
-        subparser.add_argument('--api-key', help='LiveKit API Key (default: from LIVEKIT_API_KEY env var)')
-        subparser.add_argument('--api-secret', help='LiveKit API Secret (default: from LIVEKIT_API_SECRET env var)')
-        subparser.add_argument('--room-name', default='voice-agent-test', help='Room name')
-        subparser.add_argument('--llm', default='openai/gpt-4o-mini', help='LLM provider (default: openai/gpt-4o-mini)')
-        subparser.add_argument('--stt', default='local/whisper-base', help='STT provider (default: local/whisper-base)')
-        subparser.add_argument('--tts', default='local/macos', help='TTS provider (default: local/macos)')
-        subparser.add_argument('--mood', choices=['friendly', 'professional', 'playful', 'terse'], default='friendly', help='Agent mood')
-        subparser.add_argument('--timeout', type=int, default=300, help='Session timeout in seconds')
+        subparser.add_argument('--livekit-url', default=None, help='LiveKit URL (default: from LIVEKIT_URL env var)')
+        subparser.add_argument('--api-key', default=None, help='LiveKit API Key (default: from LIVEKIT_API_KEY env var)')
+        subparser.add_argument('--api-secret', default=None, help='LiveKit API Secret (default: from LIVEKIT_API_SECRET env var)')
+        subparser.add_argument('--room-name', default=None, help='Room name (default: from ROOM_NAME env var)')
+        subparser.add_argument('--llm', default=None, help='LLM provider (default: from DEFAULT_LLM env var)')
+        subparser.add_argument('--stt', default=None, help='STT provider (default: from DEFAULT_STT env var)')
+        subparser.add_argument('--tts', default=None, help='TTS provider (default: from DEFAULT_TTS env var)')
+        subparser.add_argument('--mood', choices=['friendly', 'professional', 'playful', 'terse'], default=None, help='Agent mood (default: from AGENT_MOOD env var)')
+        subparser.add_argument('--timeout', type=int, default=None, help='Session timeout in seconds (default: from SESSION_TIMEOUT env var)')
         subparser.add_argument('--output-file', help='Write output to file')
         subparser.add_argument('--json-output', action='store_true', help='Output in JSON format')
 
-        # Demo features
-        subparser.add_argument('--verbose-tool-logging', action='store_true', help='Show detailed tool execution info')
-        subparser.add_argument('--auto-greeting', action='store_true', help='Agent greets on session start')
-        subparser.add_argument('--simulated-latency', action='store_true', help='Add artificial delay to responses')
-        subparser.add_argument('--latency-ms', type=int, default=1000, help='Simulated latency in milliseconds')
-        subparser.add_argument('--sound-effects', action='store_true', help='Play sounds on tool execution')
-        subparser.add_argument('--tool-timeline', action='store_true', help='Log tool timeline')
-        subparser.add_argument('--transcript-mode', action='store_true', help='Show real-time transcription')
-        subparser.add_argument('--debug-mode', action='store_true', help='Show internal agent state')
-        subparser.add_argument('--announcement-mode', action='store_true', help='Agent announces tools (for comparison)')
-        subparser.add_argument('--no-summary', action='store_false', dest='conversation_summary', help='Disable conversation summary')
-        subparser.add_argument('--mock-mode', action='store_true', help='Use fake responses (faster testing)')
+        # Demo features (all default to None to check env vars)
+        subparser.add_argument('--verbose-tool-logging', action='store_true', default=None, help='Show detailed tool execution info')
+        subparser.add_argument('--auto-greeting', action='store_true', default=None, help='Agent greets on session start')
+        subparser.add_argument('--simulated-latency', action='store_true', default=None, help='Add artificial delay to responses')
+        subparser.add_argument('--latency-ms', type=int, default=None, help='Simulated latency in milliseconds (default: from LATENCY_MS env var)')
+        subparser.add_argument('--sound-effects', action='store_true', default=None, help='Play sounds on tool execution')
+        subparser.add_argument('--tool-timeline', action='store_true', default=None, help='Log tool timeline')
+        subparser.add_argument('--transcript-mode', action='store_true', default=None, help='Show real-time transcription')
+        subparser.add_argument('--debug-mode', action='store_true', default=None, help='Show internal agent state')
+        subparser.add_argument('--announcement-mode', action='store_true', default=None, help='Agent announces tools (for comparison)')
+        subparser.add_argument('--no-summary', action='store_true', default=None, dest='no_summary', help='Disable conversation summary')
+        subparser.add_argument('--mock-mode', action='store_true', default=None, help='Use fake responses (faster testing)')
 
     # Text mode command
     text_parser = subparsers.add_parser('text', help='Run in text-only mode (headless, no audio)')
