@@ -1,6 +1,6 @@
 # Voice Agent Test Application
 
-A simple voice agent application to test **clean tool execution** with varying complexity levels. Built with LiveKit Agents (Python).
+A simple voice agent application to test **clean tool execution** with varying complexity levels. Built with LiveKit Agents (Python) and Tkinter.
 
 ## Features
 
@@ -11,12 +11,13 @@ A simple voice agent application to test **clean tool execution** with varying c
   - Edge case: `trigger_error` for testing error handling
 
 - **Silent Tool Execution**: Tools execute WITHOUT the agent announcing them
-- **Web UI** with:
+- **Native Desktop UI** (Tkinter) with:
   - API key configuration
   - Provider selection (STT/TTS/LLM)
   - Large RED STOP button
-  - Real-time status indicator
-  - Conversation log
+  - Real-time status indicator (Listening, Processing, Speaking, Tool Executing)
+  - Conversation log with color-coded entries
+  - Quick test action buttons
 
 ## Quick Start
 
@@ -49,30 +50,21 @@ cp .env.example .env
 ### 3. Run
 
 ```bash
-# Start the agent server
-python voice_agent.py
+# Launch the GUI
+python tkinter_ui.py
 
-# In another terminal, start the web UI
-python web_server.py
-
-# Open browser to http://localhost:8000
+# Or run in console mode for quick testing
+python tkinter_ui.py console
 ```
 
 ## Testing
 
-### Console Mode (Local Testing)
+### GUI Mode
 
-```bash
-# Run in console mode for quick local testing
-python voice_agent.py console
-```
-
-### Web UI Testing
-
-1. Open http://localhost:8000
-2. Enter your LiveKit credentials
-3. Click "Start Voice Session"
-4. Try these commands:
+1. Launch `python tkinter_ui.py`
+2. Enter your LiveKit credentials in the Configuration panel
+3. Click the blue **START** button
+4. Try speaking or clicking the quick test buttons:
 
 | Command | Tool Used | Expected Duration |
 |---------|-----------|-------------------|
@@ -86,12 +78,17 @@ python voice_agent.py console
 | "Generate a report about AI" | `generate_report` | ~6s |
 | "Query the database" | `database_query` | ~5s |
 
+### Console Mode
+
+```bash
+python tkinter_ui.py console
+```
+
 ## Project Structure
 
 ```
 voice_agent_test/
-├── voice_agent.py       # Main voice agent with all tools
-├── web_server.py        # Web UI server
+├── tkinter_ui.py        # Main GUI application with all tools
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment variables template
 ├── .gitignore
@@ -142,11 +139,10 @@ pip install -r requirements.txt
 - Check that your LiveKit project is active
 - Ensure network allows WebSocket connections
 
-### Audio not working
+### GUI not launching
 
-- Check browser microphone permissions
-- Verify microphone is not being used by another app
-- Try different browser (Chrome recommended)
+- Make sure you have Tcl/Tk installed (usually included with Python)
+- On Linux: `sudo apt-get install python3-tk`
 
 ## Architecture
 
@@ -155,6 +151,7 @@ The agent uses LiveKit Agents framework with:
 - **STT**: Deepgram Nova-2 (configurable)
 - **LLM**: OpenAI GPT-4o-mini (configurable)
 - **TTS**: Cartesia Sonic (configurable)
+- **GUI**: Tkinter with asyncio event loop in background thread
 
 ## License
 
