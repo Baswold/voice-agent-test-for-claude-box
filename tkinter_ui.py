@@ -8,13 +8,15 @@ import asyncio
 import json
 import os
 import random
+import subprocess
 import threading
 import time
 import wave
 import math
+import tempfile
 from collections import deque
 from datetime import datetime
-from typing import Any
+from typing import Any, AsyncIterable
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -28,11 +30,355 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    tts as lk_tts,
+    stt as lk_stt,
+    utils,
+    APIConnectOptions,
 )
 from livekit.plugins import deepgram, openai, cartesia, silero
 
+# Try to import pyttsx3 for local TTS
+try:
+    import pyttsx3
+    PYTTSX3_AVAILABLE = True
+except ImportError:
+    PYTTSX3_AVAILABLE = False
+
+# Try to import whisper for local STT
+try:
+    import whisper
+    import numpy as np
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+
 # Load environment variables
 load_dotenv()
+
+
+# ============================================================================
+# LOCAL TTS ENGINES
+# ============================================================================
+
+class LocalMacOSTTS(lk_tts.TTS):
+    """Local TTS using macOS built-in 'say' command."""
+
+    def __init__(self, voice: str = "Samantha", rate: int = 175):
+        super().__init__(
+            capabilities=lk_tts.TTSCapabilities(streaming=False),
+            sample_rate=22050,
+            num_channels=1,
+        )
+        self.voice = voice
+        self.rate = rate
+
+    def synthesize(self, text: str) -> lk_tts.ChunkedStream:
+        return LocalMacOSChunkedStream(text, self.voice, self.rate, self)
+
+
+class LocalMacOSChunkedStream(lk_tts.ChunkedStream):
+    """Chunked stream for macOS TTS."""
+
+    def __init__(self, text: str, voice: str, rate: int, tts: LocalMacOSTTS):
+        super().__init__(tts=tts, input_text=text)
+        self._text = text
+        self._voice = voice
+        self._rate = rate
+
+    async def _run(self) -> None:
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.aiff', delete=False) as f:
+                temp_path = f.name
+
+            # Use macOS say command to generate audio
+            cmd = [
+                'say',
+                '-v', self._voice,
+                '-r', str(self._rate),
+                '-o', temp_path,
+                '--data-format=LEI16@22050',
+                self._text
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.wait()
+
+            if process.returncode == 0 and os.path.exists(temp_path):
+                with open(temp_path, 'rb') as f:
+                    audio_data = f.read()
+
+                # Skip AIFF header (varies, but typically around 54 bytes)
+                # For raw PCM we'd need to parse properly, but for simplicity
+                # we'll send chunks
+                chunk_size = 4096
+                for i in range(0, len(audio_data), chunk_size):
+                    chunk = audio_data[i:i + chunk_size]
+                    self._event_ch.send_nowait(
+                        lk_tts.SynthesizedAudio(
+                            request_id=self._input_text,
+                            frame=lk_tts.AudioFrame(
+                                data=chunk,
+                                sample_rate=22050,
+                                num_channels=1,
+                                samples_per_channel=len(chunk) // 2,
+                            )
+                        )
+                    )
+
+                os.unlink(temp_path)
+
+        except Exception as e:
+            print(f"[LocalTTS] Error: {e}")
+
+
+class LocalPyttsx3TTS(lk_tts.TTS):
+    """Local TTS using pyttsx3 (cross-platform)."""
+
+    def __init__(self, voice_id: str | None = None, rate: int = 175):
+        super().__init__(
+            capabilities=lk_tts.TTSCapabilities(streaming=False),
+            sample_rate=22050,
+            num_channels=1,
+        )
+        self.voice_id = voice_id
+        self.rate = rate
+        self._engine = None
+        if PYTTSX3_AVAILABLE:
+            self._engine = pyttsx3.init()
+            self._engine.setProperty('rate', rate)
+            if voice_id:
+                self._engine.setProperty('voice', voice_id)
+
+    def synthesize(self, text: str) -> lk_tts.ChunkedStream:
+        return LocalPyttsx3ChunkedStream(text, self._engine, self)
+
+
+class LocalPyttsx3ChunkedStream(lk_tts.ChunkedStream):
+    """Chunked stream for pyttsx3 TTS."""
+
+    def __init__(self, text: str, engine, tts: LocalPyttsx3TTS):
+        super().__init__(tts=tts, input_text=text)
+        self._text = text
+        self._engine = engine
+
+    async def _run(self) -> None:
+        if not PYTTSX3_AVAILABLE or not self._engine:
+            return
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                temp_path = f.name
+
+            # Run pyttsx3 in a thread to avoid blocking
+            def _synthesize():
+                self._engine.save_to_file(self._text, temp_path)
+                self._engine.runAndWait()
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _synthesize)
+
+            if os.path.exists(temp_path):
+                with wave.open(temp_path, 'rb') as wav_file:
+                    audio_data = wav_file.readframes(wav_file.getnframes())
+                    sample_rate = wav_file.getframerate()
+                    num_channels = wav_file.getnchannels()
+
+                chunk_size = 4096
+                for i in range(0, len(audio_data), chunk_size):
+                    chunk = audio_data[i:i + chunk_size]
+                    self._event_ch.send_nowait(
+                        lk_tts.SynthesizedAudio(
+                            request_id=self._input_text,
+                            frame=lk_tts.AudioFrame(
+                                data=chunk,
+                                sample_rate=sample_rate,
+                                num_channels=num_channels,
+                                samples_per_channel=len(chunk) // (2 * num_channels),
+                            )
+                        )
+                    )
+
+                os.unlink(temp_path)
+
+        except Exception as e:
+            print(f"[LocalTTS] pyttsx3 error: {e}")
+
+
+def get_tts_provider(provider_str: str):
+    """Get TTS provider based on configuration string."""
+    provider, _, model = provider_str.partition('/')
+
+    if provider == "local":
+        if model == "macos" or model == "say":
+            return LocalMacOSTTS(voice="Samantha", rate=175)
+        elif model == "pyttsx3":
+            if PYTTSX3_AVAILABLE:
+                return LocalPyttsx3TTS(rate=175)
+            else:
+                print("[TTS] pyttsx3 not available, falling back to macOS say")
+                return LocalMacOSTTS(voice="Samantha", rate=175)
+        else:
+            # Default to macOS on Darwin, pyttsx3 otherwise
+            import platform
+            if platform.system() == "Darwin":
+                return LocalMacOSTTS(voice="Samantha", rate=175)
+            elif PYTTSX3_AVAILABLE:
+                return LocalPyttsx3TTS(rate=175)
+            else:
+                raise ValueError("No local TTS available. Install pyttsx3: pip install pyttsx3")
+
+    elif provider == "cartesia":
+        return cartesia.TTS(model=model or "sonic-english")
+
+    elif provider == "elevenlabs":
+        from livekit.plugins import elevenlabs
+        return elevenlabs.TTS(model=model or "turbo-2")
+
+    else:
+        raise ValueError(f"Unknown TTS provider: {provider}")
+
+
+# ============================================================================
+# LOCAL STT ENGINES
+# ============================================================================
+
+class LocalWhisperSTT(lk_stt.STT):
+    """Local STT using OpenAI's Whisper model."""
+
+    def __init__(self, model_name: str = "base", sample_rate: int = 16000):
+        super().__init__(
+            capabilities=lk_stt.STTCapabilities(
+                streaming=False,  # We simulate streaming with buffering
+                interim_results=False,
+            )
+        )
+        self.model_name = model_name
+        self._sample_rate = sample_rate
+        self._model = None
+
+        if WHISPER_AVAILABLE:
+            print(f"[Whisper] Loading model '{model_name}'...")
+            self._model = whisper.load_model(model_name)
+            print(f"[Whisper] Model loaded successfully")
+        else:
+            print("[Whisper] Whisper not available. Install with: pip install openai-whisper")
+
+    def stream(
+        self,
+        *,
+        language: str | None = None,
+        conn_options: APIConnectOptions = APIConnectOptions(),
+    ) -> "LocalWhisperStream":
+        return LocalWhisperStream(
+            stt=self,
+            model=self._model,
+            language=language,
+            sample_rate=self._sample_rate,
+        )
+
+
+class LocalWhisperStream(lk_stt.SpeechStream):
+    """Speech stream for local Whisper STT."""
+
+    def __init__(
+        self,
+        *,
+        stt: LocalWhisperSTT,
+        model,
+        language: str | None,
+        sample_rate: int,
+    ):
+        super().__init__(stt=stt, sample_rate=sample_rate)
+        self._model = model
+        self._language = language
+        self._audio_buffer = bytearray()
+        self._closed = False
+
+    async def _run(self) -> None:
+        """Main processing loop - buffers audio and transcribes on flush."""
+        from livekit import rtc
+
+        audio_bstream = utils.audio.AudioByteStream(
+            sample_rate=self._sample_rate,
+            num_channels=1,
+            samples_per_channel=self._sample_rate // 100,  # 10ms chunks
+        )
+
+        async for data in self._input_ch:
+            if isinstance(data, rtc.AudioFrame):
+                # Accumulate audio data
+                self._audio_buffer.extend(data.data.tobytes())
+            elif isinstance(data, self._FlushSentinel):
+                # Flush signal - transcribe the buffered audio
+                if len(self._audio_buffer) > 0 and self._model:
+                    await self._transcribe_buffer()
+                # Clear buffer after transcription
+                self._audio_buffer.clear()
+
+    async def _transcribe_buffer(self) -> None:
+        """Transcribe the accumulated audio buffer using Whisper."""
+        if not self._model or len(self._audio_buffer) == 0:
+            return
+
+        try:
+            # Convert bytes to numpy array for Whisper
+            audio_data = np.frombuffer(self._audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Ensure we have enough audio (Whisper needs at least 30ms typically)
+            if len(audio_data) < 480:  # 30ms at 16kHz
+                return
+
+            # Run Whisper transcription in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self._model.transcribe(audio_data, language=self._language, fp16=False)
+            )
+
+            text = result.get("text", "").strip()
+            detected_language = result.get("language", self._language or "en")
+
+            if text:  # Only send event if we got actual text
+                event = lk_stt.SpeechEvent(
+                    type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[
+                        lk_stt.SpeechData(
+                            text=text,
+                            language=detected_language,
+                            confidence=1.0,  # Whisper doesn't provide confidence scores
+                        )
+                    ],
+                )
+                self._event_ch.send_nowait(event)
+
+        except Exception as e:
+            print(f"[Whisper] Transcription error: {e}")
+
+
+def get_stt_provider(provider_str: str):
+    """Get STT provider based on configuration string."""
+    provider, _, model = provider_str.partition('/')
+
+    if provider == "local":
+        if not WHISPER_AVAILABLE:
+            print("[STT] Whisper not available. Install with: pip install openai-whisper")
+            print("[STT] Falling back to Deepgram")
+            return deepgram.STT(model="nova-2")
+
+        model = model or "base"
+        print(f"[STT] Using local Whisper model: {model}")
+        return LocalWhisperSTT(model_name=model)
+
+    elif provider == "deepgram":
+        return deepgram.STT(model=model or "nova-2")
+
+    else:
+        raise ValueError(f"Unknown STT provider: {provider}")
+
 
 # ============================================================================
 # BASE SYSTEM PROMPTS
@@ -796,19 +1142,25 @@ class VoiceAgentGUI:
 
         tk.Label(provider_frame, text="STT:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=2, sticky='w')
         self.stt_provider = ttk.Combobox(provider_frame, values=[
+            "local/whisper-tiny",
+            "local/whisper-base",
+            "local/whisper-small",
+            "local/whisper-medium",
             "deepgram/nova-2",
             "deepgram/nova-3",
         ], state='readonly', font=("Arial", 9))
-        self.stt_provider.set("deepgram/nova-2")
+        self.stt_provider.set("local/whisper-base")
         self.stt_provider.grid(row=0, column=3, sticky='ew', padx=2)
 
         tk.Label(provider_frame, text="TTS:", bg=self.colors['card_bg'], fg=self.colors['muted'], width=4, anchor='w').grid(row=0, column=4, sticky='w')
         self.tts_provider = ttk.Combobox(provider_frame, values=[
+            "local/macos",
+            "local/pyttsx3",
             "cartesia/sonic-english",
             "cartesia/sonic-2",
             "elevenlabs/turbo-2",
         ], state='readonly', font=("Arial", 9))
-        self.tts_provider.set("cartesia/sonic-english")
+        self.tts_provider.set("local/macos")
         self.tts_provider.grid(row=0, column=5, sticky='ew', padx=2)
 
         provider_frame.columnconfigure(1, weight=1)
@@ -1346,16 +1698,17 @@ class VoiceAgentGUI:
     # ============================================================================
 
     def _load_config(self):
+        # First try to load from config.json
         try:
             with open('config.json', 'r') as f:
                 config = json.load(f)
-                self.livekit_url.insert(0, config.get('livekit_url', ''))
-                self.api_key.insert(0, config.get('api_key', ''))
-                self.api_secret.insert(0, config.get('api_secret', ''))
-                self.room_name.insert(0, config.get('room_name', 'voice-agent-test'))
-                self.llm_provider.set(config.get('llm_provider', 'openai/gpt-4o-mini'))
-                self.stt_provider.set(config.get('stt_provider', 'deepgram/nova-2'))
-                self.tts_provider.set(config.get('tts_provider', 'cartesia/sonic-english'))
+                livekit_url = config.get('livekit_url', '')
+                api_key = config.get('api_key', '')
+                api_secret = config.get('api_secret', '')
+                room_name = config.get('room_name', 'voice-agent-test')
+                llm_provider = config.get('llm_provider', 'openai/gpt-4o-mini')
+                stt_provider = config.get('stt_provider', 'local/whisper-base')
+                tts_provider = config.get('tts_provider', 'local/macos')
 
                 # Load demo features
                 if 'demo_features' in config:
@@ -1365,7 +1718,26 @@ class VoiceAgentGUI:
                     self.latency_slider.set(demo_features.latency_ms)
 
         except FileNotFoundError:
-            self.room_name.insert(0, 'voice-agent-test')
+            # If config.json doesn't exist, load from .env file
+            livekit_url = os.getenv('LIVEKIT_URL', '')
+            api_key = os.getenv('LIVEKIT_API_KEY', '')
+            api_secret = os.getenv('LIVEKIT_API_SECRET', '')
+            room_name = 'voice-agent-test'
+            llm_provider = os.getenv('DEFAULT_LLM', 'openai/gpt-4o-mini')
+            stt_provider = os.getenv('DEFAULT_STT', 'local/whisper-base')
+            tts_provider = os.getenv('DEFAULT_TTS', 'local/macos')
+
+        # Insert values into GUI fields
+        if livekit_url:
+            self.livekit_url.insert(0, livekit_url)
+        if api_key:
+            self.api_key.insert(0, api_key)
+        if api_secret:
+            self.api_secret.insert(0, api_secret)
+        self.room_name.insert(0, room_name)
+        self.llm_provider.set(llm_provider)
+        self.stt_provider.set(stt_provider)
+        self.tts_provider.set(tts_provider)
 
     def _save_config(self):
         config = {
@@ -1524,18 +1896,25 @@ async def console_entrypoint(ctx: JobContext) -> None:
     gui_instance = ConsoleLogger()
 
     llm_provider = os.getenv("DEFAULT_LLM", "openai/gpt-4o-mini")
-    stt_provider = os.getenv("DEFAULT_STT", "deepgram/nova-2")
-    tts_provider = os.getenv("DEFAULT_TTS", "cartesia/sonic-english")
+    stt_provider_str = os.getenv("DEFAULT_STT", "deepgram/nova-2")
+    tts_provider_str = os.getenv("DEFAULT_TTS", "local/macos")
 
-    print(f"[CONFIG] LLM: {llm_provider}, STT: {stt_provider}, TTS: {tts_provider}")
+    print(f"[CONFIG] LLM: {llm_provider}, STT: {stt_provider_str}, TTS: {tts_provider_str}")
+
+    # Get the appropriate STT and TTS provider instances
+    stt_instance = get_stt_provider(stt_provider_str)
+    print(f"[STT] Using: {type(stt_instance).__name__}")
+
+    tts_instance = get_tts_provider(tts_provider_str)
+    print(f"[TTS] Using: {type(tts_instance).__name__}")
 
     agent = VoiceAgentTest(llm_provider=llm_provider)
 
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=stt_provider,
+        stt=stt_instance,
         llm=llm_provider,
-        tts=tts_provider,
+        tts=tts_instance,
     )
 
     print("[SESSION] Starting agent session...")
