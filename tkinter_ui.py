@@ -1698,17 +1698,35 @@ class VoiceAgentGUI:
     # ============================================================================
 
     def _load_config(self):
-        # First try to load from config.json
+        # Initialize with defaults from .env
+        livekit_url = os.getenv('LIVEKIT_URL', '')
+        api_key = os.getenv('LIVEKIT_API_KEY', '')
+        api_secret = os.getenv('LIVEKIT_API_SECRET', '')
+        room_name = 'voice-agent-test'
+        llm_provider = os.getenv('DEFAULT_LLM', 'openai/gpt-4o-mini')
+        stt_provider = os.getenv('DEFAULT_STT', 'local/whisper-base')
+        tts_provider = os.getenv('DEFAULT_TTS', 'local/macos')
+
+        # Try to load from config.json (will override .env values if present and non-empty)
         try:
             with open('config.json', 'r') as f:
                 config = json.load(f)
-                livekit_url = config.get('livekit_url', '')
-                api_key = config.get('api_key', '')
-                api_secret = config.get('api_secret', '')
-                room_name = config.get('room_name', 'voice-agent-test')
-                llm_provider = config.get('llm_provider', 'openai/gpt-4o-mini')
-                stt_provider = config.get('stt_provider', 'local/whisper-base')
-                tts_provider = config.get('tts_provider', 'local/macos')
+
+                # Only override with config.json values if they're not empty
+                if config.get('livekit_url'):
+                    livekit_url = config['livekit_url']
+                if config.get('api_key'):
+                    api_key = config['api_key']
+                if config.get('api_secret'):
+                    api_secret = config['api_secret']
+                if config.get('room_name'):
+                    room_name = config['room_name']
+                if config.get('llm_provider'):
+                    llm_provider = config['llm_provider']
+                if config.get('stt_provider'):
+                    stt_provider = config['stt_provider']
+                if config.get('tts_provider'):
+                    tts_provider = config['tts_provider']
 
                 # Load demo features
                 if 'demo_features' in config:
@@ -1718,14 +1736,7 @@ class VoiceAgentGUI:
                     self.latency_slider.set(demo_features.latency_ms)
 
         except FileNotFoundError:
-            # If config.json doesn't exist, load from .env file
-            livekit_url = os.getenv('LIVEKIT_URL', '')
-            api_key = os.getenv('LIVEKIT_API_KEY', '')
-            api_secret = os.getenv('LIVEKIT_API_SECRET', '')
-            room_name = 'voice-agent-test'
-            llm_provider = os.getenv('DEFAULT_LLM', 'openai/gpt-4o-mini')
-            stt_provider = os.getenv('DEFAULT_STT', 'local/whisper-base')
-            tts_provider = os.getenv('DEFAULT_TTS', 'local/macos')
+            pass  # Use .env defaults
 
         # Insert values into GUI fields
         if livekit_url:
@@ -1831,6 +1842,7 @@ class VoiceAgentGUI:
 
     def _create_token(self, api_key, api_secret, room_name):
         from livekit import api
+        from datetime import timedelta
         token = api.AccessToken(api_key, api_secret) \
             .with_identity("user") \
             .with_name("User") \
@@ -1840,7 +1852,7 @@ class VoiceAgentGUI:
                 can_publish=True,
                 can_subscribe=True,
             )) \
-            .with_validity(int(time.time()) + 3600)
+            .with_ttl(timedelta(hours=1))
         return token.to_jwt()
 
     def stop_session(self):
