@@ -9,6 +9,7 @@ import json
 import os
 import random
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -500,9 +501,13 @@ class AudioLevelMeter:
                 # Color gradient from green to red
                 intensity = i / self.bar_count
                 if intensity < 0.5:
-                    color = f"#{int(0 + intensity*2*100):02x}ff88"
+                    # Green to yellow: increase red channel from 0x00 to 0xff
+                    red = min(255, int(intensity * 2 * 255))
+                    color = f"#{red:02x}ff88"
                 else:
-                    color = f"#ff{int(255 - (intensity-0.5)*2*100):02x}88"
+                    # Yellow to red: decrease green channel from 0xff to 0x00
+                    green = max(0, int(255 - (intensity - 0.5) * 2 * 255))
+                    color = f"#ff{green:02x}88"
 
                 x = i * (self.bar_width + 2) + 1
                 h = int(intensity * self.max_height)
@@ -964,6 +969,7 @@ class VoiceAgentGUI:
         # State
         self.is_running = False
         self.session = None
+        self.cli_process = None  # CLI subprocess for voice mode
         self.current_status = "disconnected"  # disconnected, connecting, listening, processing, speaking
         self.agent_mood = "friendly"
         self.session_start_time = None
@@ -1740,11 +1746,15 @@ class VoiceAgentGUI:
 
         # Insert values into GUI fields
         if livekit_url:
+            self.livekit_url.delete(0, tk.END)
             self.livekit_url.insert(0, livekit_url)
         if api_key:
+            self.api_key.delete(0, tk.END)
             self.api_key.insert(0, api_key)
         if api_secret:
+            self.api_secret.delete(0, tk.END)
             self.api_secret.insert(0, api_secret)
+        self.room_name.delete(0, tk.END)
         self.room_name.insert(0, room_name)
         self.llm_provider.set(llm_provider)
         self.stt_provider.set(stt_provider)
@@ -1774,6 +1784,7 @@ class VoiceAgentGUI:
         self.root.after(0, lambda: self.status_text.config(text=text))
 
     def start_session(self):
+        """Start voice session using CLI tool as backend (works with LiveKit Cloud)."""
         self._save_config()
 
         livekit_url = self.livekit_url.get()
@@ -1794,7 +1805,7 @@ class VoiceAgentGUI:
         self.stop_btn.config(state='normal')
         self.set_status('connecting', 'Connecting...', '#ffa500')
 
-        self.log("System", "Starting voice session...", "system")
+        self.log("System", "Starting voice session via CLI backend...", "system")
 
         # Reset timeline
         if demo_features.tool_timeline:
@@ -1804,41 +1815,109 @@ class VoiceAgentGUI:
         if demo_features.audio_level_meter:
             self.audio_meter.start()
 
-        # Run the agent
-        async def run_agent():
-            try:
-                from livekit import rtc
+        # Build CLI command with all settings
+        cmd = [
+            sys.executable, 'cli_tool.py',
+            'console',  # Use console mode for audio/voice interaction
+            '--livekit-url', livekit_url,
+            '--api-key', api_key,
+            '--api-secret', api_secret,
+            '--room-name', self.room_name.get(),
+            '--llm', self.llm_provider.get(),
+            '--stt', self.stt_provider.get(),
+            '--tts', self.tts_provider.get(),
+            '--mood', self.agent_mood,
+            '--timeout', '3600',  # Run for 1 hour or until stopped
+        ]
 
-                room = rtc.Room()
-                await room.connect(
-                    livekit_url,
-                    self._create_token(api_key, api_secret, self.room_name.get())
-                )
+        # Add demo feature flags
+        if demo_features.verbose_tool_logging:
+            cmd.append('--verbose-tool-logging')
+        if demo_features.auto_greeting:
+            cmd.append('--auto-greeting')
+        if demo_features.sound_effects:
+            cmd.append('--sound-effects')
+        if demo_features.tool_timeline:
+            cmd.append('--tool-timeline')
+        if demo_features.transcript_mode:
+            cmd.append('--transcript-mode')
+        if demo_features.debug_mode:
+            cmd.append('--debug-mode')
+        if demo_features.announcement_mode:
+            cmd.append('--announcement-mode')
+        if not demo_features.conversation_summary:
+            cmd.append('--no-summary')
+        if demo_features.mock_mode:
+            cmd.append('--mock-mode')
 
-                self.set_status('listening', 'Listening', '#00ff88')
-                self.log("System", "Connected. Listening...", "system")
+        # Start CLI subprocess
+        try:
+            self.cli_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
 
-                # Auto greeting
-                if demo_features.auto_greeting:
-                    self.log("System", "Sending auto-greeting...", "debug")
-
+            # Start thread to read output
+            def read_output():
                 while self.is_running:
-                    await asyncio.sleep(0.1)
+                    line = self.cli_process.stdout.readline()
+                    if not line:
+                        break
+                    # Parse and log output
+                    self._process_cli_output(line.strip())
 
-                # Summary
-                if demo_features.conversation_summary:
-                    self._show_summary()
+            threading.Thread(target=read_output, daemon=True).start()
+            self.set_status('listening', 'Connected (via CLI)', '#00ff88')
+            self.log("System", "Voice agent started. Speak now...", "system")
 
-                await room.disconnect()
+        except Exception as e:
+            self.log("System", f"Failed to start CLI: {e}", "error")
+            self.set_status('disconnected', 'Failed', '#ff4757')
+            self.start_btn.config(state='normal')
+            self.stop_btn.config(state='disabled')
+            self.is_running = False
 
-            except Exception as e:
-                self.log("System", f"Error: {str(e)}", "error")
-                self.set_status('disconnected', 'Connection Failed', '#ff4757')
-                self.start_btn.config(state='normal')
-                self.stop_btn.config(state='disabled')
-                self.audio_meter.stop()
+    def _process_cli_output(self, line: str):
+        """Parse and log output from CLI subprocess."""
+        if not line:
+            return
 
-        async_runner.run_coroutine(run_agent())
+        # Parse CLI output format (ANSI codes stripped)
+        # CLI format: [timestamp] Type: message
+        import re
+        match = re.match(r'\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s+(\w+):\s+(.+)', line)
+        if match:
+            source, message = match.groups()
+            # Map CLI types to GUI log types
+            if source == 'User':
+                log_type = 'user'
+                self.user_messages.append({"text": message, "time": time.time()})
+                self.stats_labels["user_msgs"].config(text=str(len(self.user_messages)))
+            elif source == 'Agent':
+                log_type = 'agent'
+                self.agent_responses.append({"text": message, "time": time.time()})
+                self.stats_labels["agent_resp"].config(text=str(len(self.agent_responses)))
+            elif source == 'Tool':
+                log_type = 'tool'
+                # Track tool calls
+                if '->' in message:
+                    parts = message.split('->')
+                    tool_name = parts[0].strip()
+                    duration_str = parts[-1].strip()
+                    self.tool_calls.append({"tool": tool_name, "duration": 0, "time": time.time()})
+                    self.stats_labels["tool_calls"].config(text=str(len(self.tool_calls)))
+            elif 'Error' in source or (source == 'System' and 'Error' in message):
+                log_type = 'error'
+            else:
+                log_type = 'system'
+            self.log(source, message, log_type)
+        else:
+            # Fallback for unformatted lines
+            self.log("CLI", line, "debug")
 
     def _create_token(self, api_key, api_secret, room_name):
         from livekit import api
@@ -1857,6 +1936,16 @@ class VoiceAgentGUI:
 
     def stop_session(self):
         self.is_running = False
+
+        # Kill CLI subprocess if running
+        if hasattr(self, 'cli_process') and self.cli_process:
+            try:
+                self.cli_process.terminate()
+                self.cli_process.wait(timeout=3)
+            except Exception:
+                self.cli_process.kill()
+            self.cli_process = None
+
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.set_status('disconnected', 'Disconnected', '#555555')
